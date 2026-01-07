@@ -90,6 +90,7 @@ DRY_RUN=0
 VERBOSE=0
 CLEANUP_V1=0
 INSTALL_TOOLS=0
+CURL_OPTS=""
 
 DISTRO_ID=""
 DISTRO_VER=""
@@ -116,6 +117,7 @@ Optional:
   --dry-run                 Show commands, do not execute.
   --cleanup-v1-agent        Remove classic zabbix-agent (v1) before install.
   --with-tools              Also install zabbix-get and zabbix-sender.
+  --insecure                Ignore SSL certificate errors (curl -k).
   -h, --help                Show this help.
 
 Default behaviour:
@@ -157,6 +159,8 @@ while [[ $# -gt 0 ]]; do
             CLEANUP_V1=1; shift ;;
         --with-tools)
             INSTALL_TOOLS=1; shift ;;
+		--insecure)
+            CURL_OPTS="-k"; shift ;;
         -h|--help)
             print_usage
             exit 0 ;;
@@ -390,7 +394,7 @@ _resolve_url_rpm() {
         local base="${ZBX_BASE_URL_RPM}/${repo}/rhel/${maj}/${d}"
 
         # Verifica se o diretório existe
-        if curl --connect-timeout 10 -fsI "${base}/" >/dev/null 2>&1; then
+        if curl $CURL_OPTS --connect-timeout 10 -fsI "${base}/" >/dev/null 2>&1; then
             local latest
             latest="$(curl -s "${base}/" \
                 | grep -oE "zabbix-release-${repo}-[0-9]+\.el${maj}\.noarch\.rpm" \
@@ -420,7 +424,7 @@ resolve_release_pkg_url() {
         return 1
     fi
 
-    if [[ -n "$url" ]] && curl --connect-timeout 15 -fsI "$url" >/dev/null 2>&1; then
+    if [[ -n "$url" ]] && curl $CURL_OPTS --connect-timeout 15 -fsI "$url" >/dev/null 2>&1; then
         echo "$url"
         return 0
     else
@@ -443,7 +447,7 @@ _create_repo_file_rpm() {
     local gpg_key_file="/etc/pki/rpm-gpg/RPM-GPG-KEY-ZABBIX-A14FE591"
 
     execute mkdir -p /etc/pki/rpm-gpg
-    execute curl --connect-timeout 15 -fsSL "$gpg_key_url" -o "$gpg_key_file"
+    execute curl $CURL_OPTS --connect-timeout 15 -fsSL "$gpg_key_url" -o "$gpg_key_file"
 
     execute tee "$repo_file" > /dev/null <<-EOF
 [zabbix]
@@ -648,7 +652,7 @@ install_zbx_rpm_direct() {
     for d in "${dirs[@]}"; do
         local candidate_base="${ZBX_BASE_URL_RPM}/${REPO_BRANCH}/rhel/${maj}/${d}"
 
-        if ! curl --connect-timeout 10 -fsI "${candidate_base}/" >/dev/null 2>&1; then
+        if ! curl $CURL_OPTS --connect-timeout 10 -fsI "${candidate_base}/" >/dev/null 2>&1; then
             continue
         fi
 
@@ -677,7 +681,7 @@ install_zbx_rpm_direct() {
 
     local tmp="/tmp/${rpm_name}"
     log "Downloading package '${pkg}' from ${base}/${rpm_name}..."
-    execute curl --connect-timeout 20 -fsSL "${base}/${rpm_name}" -o "$tmp"
+    execute curl $CURL_OPTS --connect-timeout 20 -fsSL "${base}/${rpm_name}" -o "$tmp"
 
     log "Installing package '${pkg}' via rpm -Uvh..."
     execute rpm -Uvh --force "$tmp"
@@ -838,7 +842,7 @@ if is_deb; then
         trap cleanup_deb EXIT
 
         log "Downloading Debian package from $REPO_URL..."
-        curl --connect-timeout 15 -fsSL "$REPO_URL" -o "$TMPFILE" || die "Download of repository package failed."
+        curl $CURL_OPTS --connect-timeout 15 -fsSL "$REPO_URL" -o "$TMPFILE" || die "Download of repository package failed."
 
         have dpkg || die "Command 'dpkg' not found."
         log "Removing old Zabbix repo definitions (if any)..."
@@ -885,7 +889,7 @@ elif is_rpm; then
             trap cleanup_rpm EXIT
 
             log "Downloading RPM package from $REPO_URL..."
-            curl --connect-timeout 15 -fsSL "$REPO_URL" -o "$TMPFILE" || die "Download of repository package failed."
+            curl $CURL_OPTS --connect-timeout 15 -fsSL "$REPO_URL" -o "$TMPFILE" || die "Download of repository package failed."
 
             log "Installing Zabbix release package via rpm..."
             wait_for_dnf_lock
