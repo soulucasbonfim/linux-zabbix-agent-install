@@ -396,7 +396,7 @@ _resolve_url_rpm() {
         # Verifica se o diretório existe
         if curl $CURL_OPTS --connect-timeout 10 -fsI "${base}/" >/dev/null 2>&1; then
             local latest
-            latest="$(curl -s "${base}/" \
+            latest="$(curl $CURL_OPTS -s "${base}/" \
                 | grep -oE "zabbix-release-${repo}-[0-9]+\.el${maj}\.noarch\.rpm" \
                 | sort -t'-' -k4,4n | tail -1 || true)"
 
@@ -657,7 +657,7 @@ install_zbx_rpm_direct() {
         fi
 
         local listing
-        listing="$(curl -s "${candidate_base}/" || true)"
+        listing="$(curl $CURL_OPTS -s "${candidate_base}/" || true)"
         if [[ -z "$listing" ]]; then
             continue
         fi
