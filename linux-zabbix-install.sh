@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -------------------------------------------------------------------------
-# Script Name:    zabbix-install.sh
+# Script Name:    linux-zabbix-install.sh
 # Description:    Multi-distro installer for Zabbix Agent (v1 and v2).
 #                 Supports Debian/Ubuntu and RHEL-like systems (including
 #                 legacy RHEL5) with automatic repository management.
@@ -24,13 +24,14 @@
 # Creation Date:  2025-08-28
 #
 # Usage:
-#   ./zabbix-install.sh \
+#   sudo ./linux-zabbix-install.sh \
 #     --server <IP1,IP2> \
 #     [--active <IP>] \
 #     [--repo <X.Y>] \
 #     [--agent-flavor <1|2|auto>] \
 #     [--force] [--verbose] [--dry-run] \
-#     [--cleanup-v1-agent] [--with-tools]
+#     [--cleanup-v1-agent] [--with-tools] \
+#     [--insecure]
 #
 # Options:
 #   --server            Address/FQDN of the Zabbix Proxy/Server for passive checks (Server=).
@@ -45,6 +46,7 @@
 #   --dry-run           Show what commands would be run without actually executing them.
 #   --cleanup-v1-agent  Stop, disable, and remove the classic zabbix-agent (v1) before install.
 #   --with-tools        Also install zabbix-get and zabbix-sender when available.
+#   --insecure 
 #
 # Notes:
 #   - Script must be executed as root.
@@ -91,6 +93,7 @@ VERBOSE=0
 CLEANUP_V1=0
 INSTALL_TOOLS=0
 CURL_OPTS=""
+INSECURE=0
 
 DISTRO_ID=""
 DISTRO_VER=""
@@ -160,7 +163,9 @@ while [[ $# -gt 0 ]]; do
         --with-tools)
             INSTALL_TOOLS=1; shift ;;
 		--insecure)
-            CURL_OPTS="-k"; shift ;;
+            INSECURE=1
+            CURL_OPTS="-k"
+            shift ;;
         -h|--help)
             print_usage
             exit 0 ;;
@@ -176,8 +181,9 @@ done
 # -------------------------------------------------------------------------
 # Keep script open in memory and remove file from disk
 # -------------------------------------------------------------------------
-exec 3< "$0"
-rm -f -- "$0"
+if [[ $DRY_RUN -eq 0 && -f "$0" && "$0" != /dev/fd/* && "$0" != /proc/self/fd/* ]]; then
+    rm -f -- "$0" 2>/dev/null || true
+fi
 
 # -------------------------------------------------------------------------
 # Helper Functions
@@ -195,6 +201,12 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Só mostra erro se falhar
 run_silent() {
     local cmd_str="$*"
+	
+	if [[ $DRY_RUN -eq 1 ]]; then
+        log "[DRY] $cmd_str"
+        return 0
+	fi
+	
     if [[ $VERBOSE -eq 1 ]]; then
         log "Exec: $cmd_str"
         "$@"
@@ -247,8 +259,13 @@ execute() {
         printf "\b\b\b"
     done
     
-    wait "$pid"
-    local exit_code=$?
+    local exit_code
+    # Capture background exit code without tripping 'set -e'
+    if wait "$pid"; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
     tput cnorm 2>/dev/null || true
 
     if [[ $exit_code -eq 0 ]]; then
@@ -283,17 +300,45 @@ execute_may_fail() {
         sleep $delay
         printf "\b\b\b"
     done
-    wait "$pid"
-    local exit_code=$?
+    local exit_code
+    # Capture background exit code without tripping 'set -e'
+    if wait "$pid"; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
     tput cnorm 2>/dev/null || true
 
     if [[ $exit_code -eq 0 ]]; then
         printf "[OK]\n"
     else
         printf "[SKIP]\n"
-        # Opcional: cat "$temp_out" >&2
+        # Show last lines on failure to aid troubleshooting.
+        tail -n 50 "$temp_out" >&2 || true
     fi
     rm -f "$temp_out"
+}
+
+# -------------------------------------------------------------------------
+# Insecure Mode Helpers
+# -------------------------------------------------------------------------
+sync_insecure_repo_settings_rpm() {
+    # Ensure we never leave sslverify=0 behind when --insecure is NOT used.
+    # When --insecure is used, apply sslverify=0 to ALL repo sections in Zabbix repo files only.
+    local f
+    shopt -s nullglob
+
+    for f in /etc/yum.repos.d/zabbix*.repo; do
+        # Remove any previous sslverify directives (from prior runs).
+        run_silent sed -i -e '/^[[:space:]]*sslverify[[:space:]]*=/d' "$f"
+
+        if [[ $INSECURE -eq 1 ]]; then
+            # Add sslverify=0 right after every repo section header (e.g., [zabbix], [zabbix-non-supported], etc.).
+            run_silent sed -i -e '/^\[[^]]*\]$/a sslverify=0' "$f"
+        fi
+    done
+
+    shopt -u nullglob
 }
 
 # -------------------------------------------------------------------------
@@ -326,11 +371,11 @@ detect_os() {
 }
 
 is_deb() {
-    [[ "$DISTRO_ID" =~ (debian|ubuntu) ]]
+    [[ "$DISTRO_ID" =~ (debian|ubuntu) ]] || [[ "$DISTRO_LIKE" == *debian* ]] || [[ "$DISTRO_LIKE" == *ubuntu* ]]
 }
 
 is_rpm() {
-    [[ "$DISTRO_ID" =~ (rhel|centos|rocky|almalinux|ol|fedora) ]]
+    [[ "$DISTRO_ID" =~ (rhel|centos|rocky|almalinux|ol|fedora|amzn) ]] || [[ "$DISTRO_LIKE" == *rhel* ]] || [[ "$DISTRO_LIKE" == *fedora* ]] || [[ "$DISTRO_LIKE" == *centos* ]]
 }
 
 # -------------------------------------------------------------------------
@@ -369,6 +414,8 @@ map_repo_tag() {
 # -------------------------------------------------------------------------
 _resolve_url_deb() {
     local repo="$1" tag="$2"
+	local suite=""
+    local pkg_os=""
     local stable_path=""
     # Zabbix 7.2+ uses 'stable' URL structure (keep logic generic).
     local highest_version
@@ -376,7 +423,14 @@ _resolve_url_deb() {
     if [[ "$highest_version" == "$repo" ]]; then
         stable_path="/stable"
     fi
-    echo "https://repo.zabbix.com/zabbix/${repo}${stable_path}/ubuntu/pool/main/z/zabbix-release/zabbix-release_${repo}-1+ubuntu${tag}_all.deb"
+    #echo "https://repo.zabbix.com/zabbix/${repo}${stable_path}/ubuntu/pool/main/z/zabbix-release/zabbix-release_${repo}-1+ubuntu${tag}_all.deb"
+	# Use the correct repository layout for Debian vs Ubuntu.
+    case "$DISTRO_ID" in
+        ubuntu) suite="ubuntu"; pkg_os="ubuntu${tag}" ;;
+        debian) suite="debian"; pkg_os="debian${tag}" ;;
+        *) die "Unsupported Debian-family distro for .deb resolver: ${DISTRO_ID}" ;;
+    esac
+    echo "https://repo.zabbix.com/zabbix/${repo}${stable_path}/${suite}/pool/main/z/zabbix-release/zabbix-release_${repo}-1+${pkg_os}_all.deb"
 }
 
 _resolve_url_rpm() {
@@ -394,7 +448,7 @@ _resolve_url_rpm() {
         local base="${ZBX_BASE_URL_RPM}/${repo}/rhel/${maj}/${d}"
 
         # Verifica se o diretório existe
-        if curl $CURL_OPTS --connect-timeout 10 -fsI "${base}/" >/dev/null 2>&1; then
+        if curl $CURL_OPTS --connect-timeout 10 -fsIL "${base}/" >/dev/null 2>&1; then
             local latest
             latest="$(curl $CURL_OPTS -s "${base}/" \
                 | grep -oE "zabbix-release-${repo}-[0-9]+\.el${maj}\.noarch\.rpm" \
@@ -424,7 +478,7 @@ resolve_release_pkg_url() {
         return 1
     fi
 
-    if [[ -n "$url" ]] && curl $CURL_OPTS --connect-timeout 15 -fsI "$url" >/dev/null 2>&1; then
+    if [[ -n "$url" ]] && curl $CURL_OPTS --connect-timeout 15 -fsIL "$url" >/dev/null 2>&1; then
         echo "$url"
         return 0
     else
@@ -597,9 +651,9 @@ get_candidate_version() {
         cand="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2}' || true)"
     elif is_rpm; then
         if have dnf; then
-            cand="$(dnf list "$pkg" 2>/dev/null | awk -v p="$pkg" '$1 ~ "^"p"([.]|$)" {print $2; exit}' || true)"
+			cand="$(dnf -q list --available "$pkg" 2>/dev/null | awk -v p="$pkg" '$1 ~ "^"p"([.]|$)" {print $2; exit}' || true)"
         elif have yum; then
-            cand="$(yum list "$pkg" 2>/dev/null | awk -v p="$pkg" '$1 ~ "^"p"([.]|$)" {print $2; exit}' || true)"
+			cand="$(yum -q list available "$pkg" 2>/dev/null | awk -v p="$pkg" '$1 ~ "^"p"([.]|$)" {print $2; exit}' || true)"
         fi
     fi
 
@@ -652,7 +706,7 @@ install_zbx_rpm_direct() {
     for d in "${dirs[@]}"; do
         local candidate_base="${ZBX_BASE_URL_RPM}/${REPO_BRANCH}/rhel/${maj}/${d}"
 
-        if ! curl $CURL_OPTS --connect-timeout 10 -fsI "${candidate_base}/" >/dev/null 2>&1; then
+        if ! curl $CURL_OPTS --connect-timeout 10 -fsIL "${candidate_base}/" >/dev/null 2>&1; then
             continue
         fi
 
@@ -694,8 +748,8 @@ detect_os
 
 # Choose HTTP for legacy RHEL5 due to old SSL stack
 if is_rpm; then
-    local_major="${DISTRO_VER%%.*}"
-    if [[ ( "$DISTRO_ID" == "rhel" || "$DISTRO_ID" == "centos" || "$DISTRO_ID" == "ol" ) && "$local_major" -le 5 ]]; then
+    major="${DISTRO_VER%%.*}"
+    if [[ ( "$DISTRO_ID" == "rhel" || "$DISTRO_ID" == "centos" || "$DISTRO_ID" == "ol" ) && "$major" -le 5 ]]; then
         ZBX_BASE_URL_RPM="http://repo.zabbix.com/zabbix"
         log "Legacy RHEL-like (${DISTRO_VER}) detected. Using HTTP for Zabbix RPM repo."
     fi
@@ -869,6 +923,10 @@ elif is_rpm; then
     if [[ -f "$CURRENT_REPO_FILE" && "$(grep 'baseurl=' "$CURRENT_REPO_FILE" 2>/dev/null)" == *"/zabbix/${REPO_BRANCH}/"* ]]; then
         log "Existing Zabbix repo file is already configured for branch ${REPO_BRANCH}."
         log "Skipping zabbix-release reinstall."
+		if [[ $INSECURE -eq 1 ]]; then
+            log "Insecure mode enabled. Disabling SSL verification for Zabbix repo (sslverify=0)."
+            sync_insecure_repo_settings_rpm
+        fi
     else
         log "Local Zabbix repo definition missing or not matching branch ${REPO_BRANCH}. Preparing fresh zabbix-release installation."
         wait_for_dnf_lock
@@ -894,9 +952,17 @@ elif is_rpm; then
             log "Installing Zabbix release package via rpm..."
             wait_for_dnf_lock
             execute rpm -Uvh --force "$TMPFILE"
+			if [[ $INSECURE -eq 1 ]]; then
+                log "Insecure mode enabled. Disabling SSL verification for Zabbix repo (sslverify=0)."
+                sync_insecure_repo_settings_rpm
+            fi
         elif [[ "$ARCH" == "aarch64" ]]; then
             warn "zabbix-release package not found for aarch64. Creating repo file manually as a fallback."
             _create_repo_file_rpm "$REPO_BRANCH"
+			if [[ $INSECURE -eq 1 ]]; then
+                log "Insecure mode enabled. Disabling SSL verification for Zabbix repo (sslverify=0)."
+                sync_insecure_repo_settings_rpm
+            fi
         else
             die "Repository URL could not be determined for this RPM-based system."
         fi
@@ -916,6 +982,18 @@ elif is_rpm; then
         fi
     else
         log "Repository already present. Skipping cache rebuild."
+    fi
+fi
+
+# -------------------------------------------------------------------------
+# Package Metadata Refresh (Best Effort)
+# -------------------------------------------------------------------------
+if is_rpm; then
+    wait_for_dnf_lock
+    if have dnf; then
+        execute_may_fail dnf -y makecache --refresh
+    elif have yum; then
+        execute_may_fail yum -y makecache
     fi
 fi
 
@@ -1149,6 +1227,7 @@ printf "    %-18s: %s\n" "ServerActive"     "${ACTIVE:-<not set>}"
 printf "    %-18s: %s\n" "Service Name"     "$SERVICE_NAME"
 printf "    %-18s: %s\n" "Service Status"   "$SERVICE_STATE"
 printf "    %-18s: %s\n" "Service Enabled"  "$SERVICE_ENABLED"
+printf "    %-18s: %s\n" "Insecure Mode"   "$([[ $INSECURE -eq 1 ]] && echo enabled || echo disabled)"
 printf "\n"
 
 exit 0
