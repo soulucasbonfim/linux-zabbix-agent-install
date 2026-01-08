@@ -97,6 +97,7 @@ INSECURE=0
 
 DISTRO_ID=""
 DISTRO_VER=""
+DISTRO_LIKE=""   # from /etc/os-release ID_LIKE (can be empty)
 ARCH=""
 ZBX_BASE_URL_RPM="https://repo.zabbix.com/zabbix"
 
