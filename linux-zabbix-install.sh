@@ -334,7 +334,7 @@ execute() {
 
   # One-line progress with spinner (TTY only)
   local prefix
-  prefix="$(printf "%s[%s]%s %s    || Processing:%s " \
+  prefix="$(printf "%s[%s]%s %s    | Processing:%s " \
     "$C_DIM" "$(get_timestamp)" "$C_RESET" "${C_CYAN}" "$C_RESET")"
 
   local msg="${cmd_str}"
