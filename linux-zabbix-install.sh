@@ -221,15 +221,52 @@ if [[ $DRY_RUN -eq 0 && -f "$0" && "$0" != /dev/fd/* && "$0" != /proc/self/fd/* 
 fi
 
 # -------------------------------------------------------------------------
+# Logging Colors (AUTO: enabled only when terminal supports it)
+# -------------------------------------------------------------------------
+ENABLE_COLORS=0
+
+# Respect the de-facto standard opt-out
+# (If NO_COLOR=1 in environment, force disable colors)
+if [[ "${NO_COLOR:-}" != "1" ]]; then
+  # Only colorize if stdout is a TTY (avoid polluting logs/files/cron)
+  if [[ -t 1 ]]; then
+    # TERM must exist and not be dumb
+    if [[ -n "${TERM:-}" && "${TERM:-}" != "dumb" ]]; then
+      # If tput exists, verify color capability
+      if command -v tput >/dev/null 2>&1; then
+        _tput_colors="$(tput colors 2>/dev/null || echo 0)"
+        if [[ "${_tput_colors}" =~ ^[0-9]+$ ]] && (( _tput_colors >= 8 )); then
+          ENABLE_COLORS=1
+        fi
+      else
+        # No tput: best-effort (most modern terms support ANSI)
+        ENABLE_COLORS=1
+      fi
+    fi
+  fi
+fi
+
+if (( ENABLE_COLORS )); then
+  C_RESET=$'\033[0m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+else
+  C_RESET=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+fi
+
+# -------------------------------------------------------------------------
 # Helper Functions
 # -------------------------------------------------------------------------
 get_timestamp() {
     date '+%Y-%m-%d %H:%M:%S'
 }
 
-log()  { printf "[%s] [*] %s\n" "$(get_timestamp)" "$*"; }
-warn() { printf "[%s] [!] WARNING: %s\n" "$(get_timestamp)" "$*" >&2; }
-die()  { printf "[%s] [!] ERROR: %s\n" "$(get_timestamp)" "$*" >&2; exit 1; }
+log()  { printf "%s[%s]%s %s[*]%s %s\n"  "$C_DIM" "$(get_timestamp)" "$C_RESET" "$C_BLUE"   "$C_RESET" "$*"; }
+warn() { printf "%s[%s]%s %s[!]%s %s\n"  "$C_DIM" "$(get_timestamp)" "$C_RESET" "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf "%s[%s]%s %s[✗]%s %s\n"  "$C_DIM" "$(get_timestamp)" "$C_RESET" "$C_RED"    "$C_RESET" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Função para comandos rápidos que não devem sujar a tela (ex: sed, echo, rm)
@@ -325,10 +362,10 @@ execute() {
     tput cnorm 2>/dev/null || true
 
     if [[ $exit_code -eq 0 ]]; then
-        printf "[OK]\n"
+        printf "%s[OK]%s\n" "$C_GREEN" "$C_RESET"
         rm -f "$temp_out"
     else
-        printf "[FAIL]\n"
+        printf "%s[FAIL]%s\n" "$C_RED" "$C_RESET"
         cat "$temp_out" >&2
         rm -f "$temp_out"
         die "Command failed: $cmd_str"
@@ -374,9 +411,9 @@ execute_may_fail() {
     LAST_MAY_FAIL_RC="$exit_code"
 
     if [[ $exit_code -eq 0 ]]; then
-        printf "[OK]\n"
+        printf "%s[OK]%s\n" "$C_GREEN" "$C_RESET"
     else
-        printf "[SKIP]\n"
+        printf "%s[SKIP]%s\n" "$C_YELLOW" "$C_RESET"
         tail -n 50 "$temp_out" >&2 || true
     fi
     rm -f "$temp_out"
