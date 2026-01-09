@@ -273,7 +273,7 @@ get_timestamp() {
 log()  { printf "%s[%s]%s %s %s\n" "$C_DIM" "$(get_timestamp)" "$C_RESET" "$TAG_INFO" "$*"; }
 warn() { printf "%s[%s]%s %s %s\n" "$C_DIM" "$(get_timestamp)" "$C_RESET" "$TAG_WARN" "$*" >&2; }
 die()  { printf "%s[%s]%s %s %s\n" "$C_DIM" "$(get_timestamp)" "$C_RESET" "$TAG_ERR"  "$*" >&2; exit 1; }
-ok()  { printf "%s%s %s %s\n" "$C_DIM" "$C_RESET" "$TAG_OK" "$*"; }
+ok()  { printf "%s%s%s %s\n" "$C_DIM" "$C_RESET" "$TAG_OK" "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Função para comandos rápidos que não devem sujar a tela (ex: sed, echo, rm)
