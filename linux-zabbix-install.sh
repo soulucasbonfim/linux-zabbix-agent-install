@@ -273,6 +273,7 @@ get_timestamp() {
 log()  { printf "%s[%s]%s %s %s\n" "$C_DIM" "$(get_timestamp)" "$C_RESET" "$TAG_INFO" "$*"; }
 warn() { printf "%s[%s]%s %s %s\n" "$C_DIM" "$(get_timestamp)" "$C_RESET" "$TAG_WARN" "$*" >&2; }
 die()  { printf "%s[%s]%s %s %s\n" "$C_DIM" "$(get_timestamp)" "$C_RESET" "$TAG_ERR"  "$*" >&2; exit 1; }
+ok()   { printf "%s %s %s\n" "$C_RESET" "$TAG_OK"   "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Função para comandos rápidos que não devem sujar a tela (ex: sed, echo, rm)
@@ -1555,7 +1556,9 @@ elif is_rpm; then
     RELVER="$(rpm -q --qf '%{VERSION}-%{RELEASE}\n' zabbix-release 2>/dev/null || true)"
 fi
 
-printf "\n[+] Zabbix Agent installation process finished.\n"
+printf "\n"
+ok "[+] Zabbix Agent installation process finished."
+printf "\n"
 if [[ $DRY_RUN -eq 1 ]]; then
     printf "    NOTE: This was a dry run. No actual changes were made to the system.\n"
 fi
