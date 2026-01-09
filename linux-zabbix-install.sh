@@ -47,6 +47,8 @@
 #   --cleanup-v1-agent  Stop, disable, and remove the classic zabbix-agent (v1) before install.
 #   --with-tools        Also install zabbix-get and zabbix-sender when available.
 #   --insecure          Ignore SSL certificate errors (curl -k).
+#   --no-gpg-check      Disable RPM/DNF/YUM package signature verification (also implied by --insecure unless overridden).
+#   --gpg-check         Enforce signature verification even if --insecure is used.
 #
 # Notes:
 #   - Script must be executed as root.
@@ -92,8 +94,17 @@ DRY_RUN=0
 VERBOSE=0
 CLEANUP_V1=0
 INSTALL_TOOLS=0
-CURL_OPTS=""
+CURL_OPTS=()
 INSECURE=0
+
+NO_GPGCHECK=0
+NO_GPGCHECK_SET=0
+PKG_NOGPGCHECK_ARGS=()
+RPM_NOGPG_ARGS=()
+LAST_MAY_FAIL_RC=0
+
+RPM_OSDIR=""
+RPM_MAJOR=""
 
 DISTRO_ID=""
 DISTRO_VER=""
@@ -120,8 +131,10 @@ Optional:
   --verbose                 Show full command output.
   --dry-run                 Show commands, do not execute.
   --cleanup-v1-agent        Remove classic zabbix-agent (v1) before install.
-  --with-tools              Also install zabbix-get and zabbix-sender when available.
+  --with-tools              Also install zabbix-get and zabbix-sender.
   --insecure                Ignore SSL certificate errors (curl -k).
+  --no-gpg-check            Disable RPM/DNF/YUM package signature verification (also implied by --insecure unless overridden).
+  --gpg-check               Enforce signature verification even if --insecure is used.
   -h, --help                Show this help.
 
 Default behaviour:
@@ -165,7 +178,15 @@ while [[ $# -gt 0 ]]; do
             INSTALL_TOOLS=1; shift ;;
 		--insecure)
             INSECURE=1
-            CURL_OPTS="-k"
+            CURL_OPTS+=(-k)
+            shift ;;
+        --no-gpg-check)
+            NO_GPGCHECK=1
+            NO_GPGCHECK_SET=1
+            shift ;;
+        --gpg-check)
+            NO_GPGCHECK=0
+            NO_GPGCHECK_SET=1
             shift ;;
         -h|--help)
             print_usage
@@ -178,6 +199,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$SERVER" ]] || { echo "[!] Missing required parameter: --server" >&2; print_usage; exit 1; }
+
+# If --insecure was used and user did not explicitly choose gpg behavior, default to no-gpg-check
+if [[ $INSECURE -eq 1 && $NO_GPGCHECK_SET -eq 0 ]]; then
+    NO_GPGCHECK=1
+fi
+
+if [[ $NO_GPGCHECK -eq 1 ]]; then
+    PKG_NOGPGCHECK_ARGS=(--nogpgcheck)
+    RPM_NOGPG_ARGS=(--nosignature --nodigest)
+else
+    PKG_NOGPGCHECK_ARGS=()
+    RPM_NOGPG_ARGS=()
+fi
 
 # -------------------------------------------------------------------------
 # Keep script open in memory and remove file from disk
@@ -218,6 +252,27 @@ run_silent() {
     out="$("$@" 2>&1)" || { echo "$out" >&2; die "Command failed: $cmd_str"; }
 }
 
+tmpfile_create() {
+    if have mktemp; then
+        mktemp
+        return 0
+    fi
+    # Fallback (best-effort). Ensure file exists.
+    local f="/tmp/zbx.$$.$RANDOM.tmp"
+    : > "$f" 2>/dev/null || true
+    echo "$f"
+}
+
+ver_ge_xy() {
+    # Compare X.Y numbers only
+    local a="$1" b="$2"
+    local a1 a2 b1 b2
+    IFS=. read -r a1 a2 _ <<<"$a"
+    IFS=. read -r b1 b2 _ <<<"$b"
+    a1=${a1:-0}; a2=${a2:-0}; b1=${b1:-0}; b2=${b2:-0}
+    (( a1 > b1 )) || (( a1 == b1 && a2 >= b2 ))
+}
+
 # Função visual para comandos demorados (dnf, apt, curl)
 execute() {
     local cmd_str="$*"
@@ -243,7 +298,7 @@ execute() {
     printf "[%s] [*] Processing: %-40s" "$(get_timestamp)" "${cmd_str:0:40}..."
     
     local temp_out
-    temp_out="$(mktemp)"
+    temp_out="$(tmpfile_create)"
     
     "$@" > "$temp_out" 2>&1 &
     local pid=$!
@@ -255,7 +310,7 @@ execute() {
     while ps -p "$pid" > /dev/null 2>&1; do
         local temp=${spinstr#?}
         printf "[%c]" "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
+		spinstr=$temp${spinstr%"$temp"}
         sleep $delay
         printf "\b\b\b"
     done
@@ -282,25 +337,31 @@ execute() {
 
 execute_may_fail() {
     local cmd_str="$*"
-    if [[ $DRY_RUN -eq 1 ]]; then log "[DRY][IGNORE] $cmd_str"; return 0; fi
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log "[DRY][IGNORE] $cmd_str"
+        LAST_MAY_FAIL_RC=0
+        return 0
+    fi
 
     printf "[%s] [*] Attempting: %-40s" "$(get_timestamp)" "${cmd_str:0:40}..."
 
     local temp_out
-    temp_out="$(mktemp)"
+    temp_out="$(tmpfile_create)"
+
     "$@" > "$temp_out" 2>&1 &
     local pid=$!
     local delay=0.1
     local spinstr='|/-\'
-    
+
     tput civis 2>/dev/null || true
     while ps -p "$pid" > /dev/null 2>&1; do
         local temp=${spinstr#?}
         printf "[%c]" "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
+        spinstr=$temp${spinstr%"$temp"}
+        sleep "$delay"
         printf "\b\b\b"
     done
+
     local exit_code
     # Capture background exit code without tripping 'set -e'
     if wait "$pid"; then
@@ -310,14 +371,18 @@ execute_may_fail() {
     fi
     tput cnorm 2>/dev/null || true
 
+    LAST_MAY_FAIL_RC="$exit_code"
+
     if [[ $exit_code -eq 0 ]]; then
         printf "[OK]\n"
     else
         printf "[SKIP]\n"
-        # Show last lines on failure to aid troubleshooting.
         tail -n 50 "$temp_out" >&2 || true
     fi
     rm -f "$temp_out"
+
+    # IMPORTANT: must not propagate non-zero under `set -e`
+    return 0
 }
 
 # -------------------------------------------------------------------------
@@ -349,8 +414,9 @@ detect_os() {
     if [[ -f /etc/os-release ]]; then
         # shellcheck source=/dev/null
         . /etc/os-release
-        DISTRO_ID="$(printf '%s' "${ID:-unknown}" | tr '[:upper:]' '[:lower:]')"
+		DISTRO_ID="$(printf '%s' "${ID:-unknown}" | tr '[:upper:]' '[:lower:]')"
         DISTRO_VER="${VERSION_ID:-}"
+        DISTRO_LIKE="$(printf '%s' "${ID_LIKE:-}" | tr '[:upper:]' '[:lower:]')"
 
     elif [[ -f /etc/redhat-release ]]; then
         DISTRO_ID="rhel"
@@ -401,13 +467,79 @@ map_repo_tag() {
             local major="${ver%%.*}"
             echo "el${major}"
             ;;
-        fedora)
-            echo "fc${ver%%.*}"
+		fedora)
+            # Best-effort mapping: Zabbix RPM repos are EL-oriented; map Fedora to nearest EL major.
+            local fmaj="${ver%%.*}"
+            if [[ "$fmaj" -ge 40 ]]; then
+                echo "el9"
+            else
+                echo "el8"
+            fi
+            ;;
+		amzn)
+            # Amazon Linux: VERSION_ID is typically "2" or "2023"
+            case "$ver" in
+                2|2.*) echo "amzn2" ;;
+                2023|2023.*) echo "amzn2023" ;;
+                *) die "Unsupported Amazon Linux version: $ver" ;;
+            esac
             ;;
         *)
             die "Unsupported distribution: $id $ver"
             ;;
     esac
+}
+
+init_rpm_repo_context() {
+    # Determine repo "osdir" used by repo.zabbix.com for RPM trees.
+    # This does NOT change package suffix (.el9, .amzn2023, etc.), only the directory path.
+    RPM_OSDIR="rhel"
+    case "$DISTRO_ID" in
+        rocky) RPM_OSDIR="rocky" ;;
+        almalinux) RPM_OSDIR="alma" ;;
+        ol|oraclelinux) RPM_OSDIR="oracle" ;;
+        centos) RPM_OSDIR="centos" ;;
+        rhel) RPM_OSDIR="rhel" ;;
+        amzn) RPM_OSDIR="amazonlinux" ;;
+        fedora) RPM_OSDIR="rhel" ;;   # Fedora is mapped to EL in your map_repo_tag()
+        *) RPM_OSDIR="rhel" ;;
+    esac
+
+    # Determine "major" directory component from REPO_TAG
+    case "${REPO_TAG:-}" in
+        el*) RPM_MAJOR="${REPO_TAG#el}" ;;
+        amzn2) RPM_MAJOR="2" ;;
+        amzn2023) RPM_MAJOR="2023" ;;
+        *) RPM_MAJOR="" ;;
+    esac
+}
+
+rpm_repo_root_candidates() {
+    # Echo candidate roots (without trailing /arch) in priority order.
+    # Format: <base>/<branch>/<prefix>/<osdir>/<major>
+    local repo_branch="$1"
+    local osdir="${RPM_OSDIR}"
+    local maj="${RPM_MAJOR}"
+
+    # Primary then fallbacks (helpful when Zabbix publishes in another osdir)
+    local -a osdirs=("$osdir")
+    if [[ "$osdir" != "rhel" ]]; then osdirs+=("rhel"); fi
+    if [[ "${REPO_TAG}" == el* ]]; then
+        osdirs+=("centos" "rocky" "alma" "oracle")
+    fi
+
+    local -a prefixes=("release" "stable" "")  # "" => legacy layout
+    local p o
+
+    for p in "${prefixes[@]}"; do
+        for o in "${osdirs[@]}"; do
+            if [[ -n "$p" ]]; then
+                printf '%s/%s/%s/%s/%s\n' "$ZBX_BASE_URL_RPM" "$repo_branch" "$p" "$o" "$maj"
+            else
+                printf '%s/%s/%s/%s\n' "$ZBX_BASE_URL_RPM" "$repo_branch" "$o" "$maj"
+            fi
+        done
+    done
 }
 
 # -------------------------------------------------------------------------
@@ -419,9 +551,7 @@ _resolve_url_deb() {
     local pkg_os=""
     local stable_path=""
     # Zabbix 7.2+ uses 'stable' URL structure (keep logic generic).
-    local highest_version
-    highest_version=$(printf "%s\n%s" "$repo" "7.2" | sort -V | tail -n1)
-    if [[ "$highest_version" == "$repo" ]]; then
+    if ver_ge_xy "$repo" "7.2"; then
         stable_path="/stable"
     fi
     #echo "https://repo.zabbix.com/zabbix/${repo}${stable_path}/ubuntu/pool/main/z/zabbix-release/zabbix-release_${repo}-1+ubuntu${tag}_all.deb"
@@ -436,33 +566,58 @@ _resolve_url_deb() {
 
 _resolve_url_rpm() {
     local repo="$1" tag="$2"
-    local maj="${tag#el}"
 
-    # Diretórios possíveis para pacotes do release
-    local dirs=(
-        "noarch"
-        "x86_64"
-        "i386"
-    )
+    # Candidate arch dirs to probe for zabbix-release package (it is usually noarch, but not guaranteed)
+    local -a dirs=("noarch" "x86_64" "aarch64" "i386")
 
-    for d in "${dirs[@]}"; do
-        local base="${ZBX_BASE_URL_RPM}/${repo}/rhel/${maj}/${d}"
+    local root arch
+    while IFS= read -r root; do
+        [[ -z "$root" ]] && continue
 
-        # Verifica se o diretório existe
-        if curl $CURL_OPTS --connect-timeout 10 -fsIL "${base}/" >/dev/null 2>&1; then
-            local latest
-            latest="$(curl $CURL_OPTS -s "${base}/" \
-                | grep -oE "zabbix-release-${repo}-[0-9]+\.el${maj}\.noarch\.rpm" \
-                | sort -t'-' -k4,4n | tail -1 || true)"
+        for arch in "${dirs[@]}"; do
+            local base="${root}/${arch}"
 
-            if [[ -n "$latest" ]]; then
-                echo "${base}/${latest}"
-                return 0
+            # Does directory exist?
+            if curl "${CURL_OPTS[@]}" --connect-timeout 10 -fsIL "${base}/" >/dev/null 2>&1; then
+                local listing
+                listing="$(curl "${CURL_OPTS[@]}" --connect-timeout 10 -fsSL "${base}/" 2>/dev/null || true)"
+                [[ -z "$listing" ]] && continue
+
+                # Prefer "latest" if present (most predictable, no sorting required)
+                local latest=""
+                latest="$(printf '%s\n' "$listing" \
+                    | grep -oE "zabbix-release-latest[^\"[:space:]]*\.${tag}\.noarch\.rpm" \
+                    | head -n 1 || true)"
+
+                if [[ -n "$latest" ]]; then
+                    echo "${base}/${latest}"
+                    return 0
+                fi
+
+                # Fallback: pick highest numeric release for zabbix-release-${repo}-N.*.${tag}.noarch.rpm
+                local best_file="" best_rel=0
+                local f rel
+                while IFS= read -r f; do
+                    [[ -z "$f" ]] && continue
+                    rel="$(printf '%s' "$f" | sed -nE "s/^zabbix-release-${repo}-([0-9]+).*\.${tag}\.noarch\.rpm$/\1/p")"
+                    [[ -z "$rel" ]] && continue
+                    if (( rel > best_rel )); then
+                        best_rel="$rel"
+                        best_file="$f"
+                    fi
+                done < <(printf '%s\n' "$listing" \
+                    | grep -oE "zabbix-release-${repo}-[0-9]+[^\"[:space:]]*\.${tag}\.noarch\.rpm" \
+                    | sort -u)
+
+                if [[ -n "$best_file" ]]; then
+                    echo "${base}/${best_file}"
+                    return 0
+                fi
             fi
-        fi
-    done
+        done
+    done < <(rpm_repo_root_candidates "$repo")
 
-    log "No valid zabbix-release package found for repo=$repo and tag=$tag in any architecture directory."
+    log "No valid zabbix-release package found for repo=$repo and tag=$tag in any known RPM layout."
     return 1
 }
 
@@ -479,7 +634,7 @@ resolve_release_pkg_url() {
         return 1
     fi
 
-    if [[ -n "$url" ]] && curl $CURL_OPTS --connect-timeout 15 -fsIL "$url" >/dev/null 2>&1; then
+    if [[ -n "$url" ]] && curl "${CURL_OPTS[@]}" --connect-timeout 15 -fsIL "$url" >/dev/null 2>&1; then
         echo "$url"
         return 0
     else
@@ -488,37 +643,146 @@ resolve_release_pkg_url() {
     fi
 }
 
+zbx_repo_host() {
+    # ZBX_BASE_URL_RPM is ".../zabbix" (or http://.../zabbix)
+    echo "${ZBX_BASE_URL_RPM%/zabbix}"
+}
+
+pick_rpm_repo_root() {
+    # Echo a root like: https://repo.zabbix.com/zabbix/<branch>/<release|stable>/<osdir>/<major>
+    # Verified by probing for a plausible arch directory.
+    local repo_branch="$1"
+    local -a probe_arches=("x86_64" "aarch64" "i386")
+    local root arch
+
+    while IFS= read -r root; do
+        [[ -z "$root" ]] && continue
+        for arch in "${probe_arches[@]}"; do
+            if curl "${CURL_OPTS[@]}" --connect-timeout 10 -fsIL "${root}/${arch}/" >/dev/null 2>&1; then
+                echo "$root"
+                return 0
+            fi
+        done
+    done < <(rpm_repo_root_candidates "$repo_branch")
+
+    return 1
+}
+
+pick_rpm_nonsupported_root() {
+    # Best-effort: non-supported historically is under /non-supported/<osdir>/<major>/<arch>/
+    local ns_base
+    ns_base="$(zbx_repo_host)/non-supported"
+
+    local osdir="${RPM_OSDIR}"
+    local maj="${RPM_MAJOR}"
+
+    local -a osdirs=("$osdir")
+    if [[ "$osdir" != "rhel" ]]; then osdirs+=("rhel"); fi
+    if [[ "${REPO_TAG}" == el* ]]; then
+        osdirs+=("centos" "rocky" "alma" "oracle")
+    fi
+
+    local -a probe_arches=("x86_64" "aarch64" "i386")
+    local o arch
+
+    for o in "${osdirs[@]}"; do
+        for arch in "${probe_arches[@]}"; do
+            if curl "${CURL_OPTS[@]}" --connect-timeout 10 -fsIL "${ns_base}/${o}/${maj}/${arch}/" >/dev/null 2>&1; then
+                echo "${ns_base}/${o}/${maj}"
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
 # -------------------------------------------------------------------------
 # RPM Repo File Creation Fallback (aarch64 etc.)
 # -------------------------------------------------------------------------
 _create_repo_file_rpm() {
     local repo_branch="$1"
-    local major_ver="${REPO_TAG#el}"
     local repo_file="/etc/yum.repos.d/zabbix.repo"
 
     log "Creating Zabbix repo file manually at $repo_file"
+
+    # Determine gpg behavior
+    local gpgcheck_val="1"
+    if [[ $NO_GPGCHECK -eq 1 ]]; then
+        gpgcheck_val="0"
+    fi
 
     local gpg_key_url="https://repo.zabbix.com/RPM-GPG-KEY-ZABBIX-A14FE591"
     local gpg_key_file="/etc/pki/rpm-gpg/RPM-GPG-KEY-ZABBIX-A14FE591"
 
     execute mkdir -p /etc/pki/rpm-gpg
-    execute curl $CURL_OPTS --connect-timeout 15 -fsSL "$gpg_key_url" -o "$gpg_key_file"
+    execute curl "${CURL_OPTS[@]}" --connect-timeout 15 -fsSL "$gpg_key_url" -o "$gpg_key_file"
 
+    # Pick base roots dynamically (supports /release, /stable, legacy; supports osdir variations)
+    local root
+    root="$(pick_rpm_repo_root "$repo_branch" || true)"
+    [[ -n "$root" ]] || die "Could not determine a valid RPM repo root for branch ${repo_branch} (osdir=${RPM_OSDIR}, major=${RPM_MAJOR})."
+
+    local ns_root=""
+    ns_root="$(pick_rpm_nonsupported_root || true)"
+
+    # Insecure repo option line (only when enabled)
+    local ssl_line=""
+    if [[ $INSECURE -eq 1 ]]; then
+        ssl_line="sslverify=0"
+    fi
+
+    # Write repo file
     execute tee "$repo_file" > /dev/null <<-EOF
 [zabbix]
 name=Zabbix Official Repository - \$basearch
-baseurl=https://repo.zabbix.com/zabbix/$repo_branch/rhel/$major_ver/\$basearch/
+baseurl=${root}/\$basearch/
 enabled=1
-gpgcheck=1
-gpgkey=file://$gpg_key_file
+gpgcheck=${gpgcheck_val}
+gpgkey=file://${gpg_key_file}
+${ssl_line}
 
+EOF
+
+    if [[ -n "$ns_root" ]]; then
+        execute tee -a "$repo_file" > /dev/null <<-EOF
 [zabbix-non-supported]
 name=Zabbix Official Repository non-supported - \$basearch
-baseurl=https://repo.zabbix.com/non-supported/rhel/$major_ver/\$basearch/
+baseurl=${ns_root}/\$basearch/
 enabled=1
-gpgcheck=1
-gpgkey=file://$gpg_key_file
+gpgcheck=${gpgcheck_val}
+gpgkey=file://${gpg_key_file}
+${ssl_line}
+
 EOF
+    else
+        warn "Non-supported repo root not found (best-effort). Skipping [zabbix-non-supported] section."
+    fi
+}
+
+proc_running() {
+    # Usage: proc_running <name>
+    local name="$1"
+    if have pgrep; then
+        pgrep -x "$name" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    # Fallback: ps output varies; this is best-effort.
+    ps ax 2>/dev/null | grep -E "[[:space:]]${name}([[:space:]]|$)" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+rpm_lock_busy() {
+    # Prefer fuser, fallback to lsof, else "unknown" => assume not busy.
+    if have fuser; then
+        fuser /var/lib/rpm/.rpm.lock >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    if have lsof; then
+        lsof /var/lib/rpm/.rpm.lock >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    return 1
 }
 
 # -------------------------------------------------------------------------
@@ -534,15 +798,26 @@ wait_for_dnf_lock() {
 
     log "Checking for dnf/yum activity..."
 
-    while pgrep -x dnf >/dev/null 2>&1 || pgrep -x yum >/dev/null 2>&1 || fuser /var/lib/rpm/.rpm.lock >/dev/null 2>&1; do
+    while proc_running dnf || proc_running yum || rpm_lock_busy; do
         ((retries--)) || die "Timeout waiting for dnf/yum to finish"
 
         local dnf_pids
-        dnf_pids="$(pgrep -x dnf 2>/dev/null || true)"
         local yum_pids
-        yum_pids="$(pgrep -x yum 2>/dev/null || true)"
         local rpm_pids
-        rpm_pids="$(fuser /var/lib/rpm/.rpm.lock 2>/dev/null || true)"
+		
+        if have pgrep; then
+            dnf_pids="$(pgrep -x dnf 2>/dev/null || true)"
+            yum_pids="$(pgrep -x yum 2>/dev/null || true)"
+        else
+            dnf_pids=""
+            yum_pids=""
+        fi
+
+        if have fuser; then
+            rpm_pids="$(fuser /var/lib/rpm/.rpm.lock 2>/dev/null || true)"
+        else
+            rpm_pids=""
+        fi
 
         if [[ -n "$dnf_pids$yum_pids$rpm_pids" ]]; then
             warn "Blocking processes detected:"
@@ -707,12 +982,12 @@ install_zbx_rpm_direct() {
     for d in "${dirs[@]}"; do
         local candidate_base="${ZBX_BASE_URL_RPM}/${REPO_BRANCH}/rhel/${maj}/${d}"
 
-        if ! curl $CURL_OPTS --connect-timeout 10 -fsIL "${candidate_base}/" >/dev/null 2>&1; then
+        if ! curl "${CURL_OPTS[@]}" --connect-timeout 10 -fsIL "${candidate_base}/" >/dev/null 2>&1; then
             continue
         fi
 
         local listing
-        listing="$(curl $CURL_OPTS -s "${candidate_base}/" || true)"
+        listing="$(curl "${CURL_OPTS[@]}" -s "${candidate_base}/" || true)"
         if [[ -z "$listing" ]]; then
             continue
         fi
@@ -736,10 +1011,10 @@ install_zbx_rpm_direct() {
 
     local tmp="/tmp/${rpm_name}"
     log "Downloading package '${pkg}' from ${base}/${rpm_name}..."
-    execute curl $CURL_OPTS --connect-timeout 20 -fsSL "${base}/${rpm_name}" -o "$tmp"
+    execute curl "${CURL_OPTS[@]}" --connect-timeout 20 -fsSL "${base}/${rpm_name}" -o "$tmp"
 
     log "Installing package '${pkg}' via rpm -Uvh..."
-    execute rpm -Uvh --force "$tmp"
+    execute rpm -Uvh --force "${RPM_NOGPG_ARGS[@]}" "$tmp"
 }
 
 # -------------------------------------------------------------------------
@@ -800,6 +1075,9 @@ fi
 
 # ------------------ Repository Resolution ------------------
 REPO_TAG="$(map_repo_tag "$DISTRO_ID" "$DISTRO_VER")"
+if is_rpm; then
+    init_rpm_repo_context
+fi
 
 # Exemplo de checagem explícita de compatibilidade forçada
 if [[ "$REPO_TAG" == "el8" && "$REPO_OVERRIDE" == "6.0" ]]; then
@@ -893,11 +1171,11 @@ if is_deb; then
         log "Zabbix release missing or not matching branch ${REPO_BRANCH}. Proceeding with fresh installation."
 
         TMPFILE="/tmp/zbx-release.$$"
-        cleanup_deb() { execute rm -f "$TMPFILE"; }
+		cleanup_deb() { rm -f "$TMPFILE" 2>/dev/null || true; }
         trap cleanup_deb EXIT
 
         log "Downloading Debian package from $REPO_URL..."
-        curl $CURL_OPTS --connect-timeout 15 -fsSL "$REPO_URL" -o "$TMPFILE" || die "Download of repository package failed."
+        curl "${CURL_OPTS[@]}" --connect-timeout 15 -fsSL "$REPO_URL" -o "$TMPFILE" || die "Download of repository package failed."
 
         have dpkg || die "Command 'dpkg' not found."
         log "Removing old Zabbix repo definitions (if any)..."
@@ -911,7 +1189,7 @@ if is_deb; then
 
     if [[ "$REPO_WAS_INSTALLED" -eq 1 ]]; then
         log "Updating package lists after repository installation..."
-        execute apt-get update -y
+        execute apt-get update
     else
         log "Repository already present. Skipping apt-get update."
     fi
@@ -944,15 +1222,15 @@ elif is_rpm; then
     if [[ $REPO_WAS_INSTALLED -eq 1 ]]; then
         if [[ -n "$REPO_URL" ]]; then
             TMPFILE="/tmp/zbx-release.$$"
-            cleanup_rpm() { execute rm -f "$TMPFILE"; }
+            cleanup_rpm() { rm -f "$TMPFILE" 2>/dev/null || true; }
             trap cleanup_rpm EXIT
 
             log "Downloading RPM package from $REPO_URL..."
-            curl $CURL_OPTS --connect-timeout 15 -fsSL "$REPO_URL" -o "$TMPFILE" || die "Download of repository package failed."
+            curl "${CURL_OPTS[@]}" --connect-timeout 15 -fsSL "$REPO_URL" -o "$TMPFILE" || die "Download of repository package failed."
 
             log "Installing Zabbix release package via rpm..."
             wait_for_dnf_lock
-            execute rpm -Uvh --force "$TMPFILE"
+            execute rpm -Uvh --force "${RPM_NOGPG_ARGS[@]}" "$TMPFILE"
 			if [[ $INSECURE -eq 1 ]]; then
                 log "Insecure mode enabled. Disabling SSL verification for Zabbix repo (sslverify=0)."
                 sync_insecure_repo_settings_rpm
@@ -1098,9 +1376,9 @@ else
         else
             wait_for_dnf_lock
             if have dnf; then
-                execute dnf install -y "$AGENT_PKG" --nogpgcheck
+                execute dnf install -y "${PKG_NOGPGCHECK_ARGS[@]}" "$AGENT_PKG"
             elif have yum; then
-                execute yum install -y "$AGENT_PKG" --nogpgcheck
+                execute yum install -y "${PKG_NOGPGCHECK_ARGS[@]}" "$AGENT_PKG"
             else
                 die "Neither dnf nor yum detected; cannot install ${AGENT_PKG}."
             fi
@@ -1116,9 +1394,9 @@ if [[ $INSTALL_TOOLS -eq 1 ]]; then
     else
         wait_for_dnf_lock
         if have dnf; then
-            execute_may_fail dnf install -y zabbix-get zabbix-sender --nogpgcheck
+			execute_may_fail dnf install -y "${PKG_NOGPGCHECK_ARGS[@]}" zabbix-get zabbix-sender
         elif have yum; then
-            execute_may_fail yum install -y zabbix-get zabbix-sender --nogpgcheck
+            execute_may_fail yum install -y "${PKG_NOGPGCHECK_ARGS[@]}" zabbix-get zabbix-sender
         else
             warn "Neither dnf nor yum detected; cannot install Zabbix tools."
         fi
@@ -1152,9 +1430,9 @@ if [[ ! -f "$CONF" ]]; then
         else
             wait_for_dnf_lock
             if have dnf; then
-                execute dnf reinstall -y "$AGENT_PKG" --nogpgcheck
+                execute dnf reinstall -y "${PKG_NOGPGCHECK_ARGS[@]}" "$AGENT_PKG"
             elif have yum; then
-                execute yum reinstall -y "$AGENT_PKG" --nogpgcheck
+				execute yum reinstall -y "${PKG_NOGPGCHECK_ARGS[@]}" "$AGENT_PKG"
             else
                 die "Neither dnf nor yum detected; cannot reinstall ${AGENT_PKG} to restore config."
             fi
