@@ -46,7 +46,7 @@
 #   --dry-run           Show what commands would be run without actually executing them.
 #   --cleanup-v1-agent  Stop, disable, and remove the classic zabbix-agent (v1) before install.
 #   --with-tools        Also install zabbix-get and zabbix-sender when available.
-#   --insecure 
+#   --insecure          Ignore SSL certificate errors (curl -k).
 #
 # Notes:
 #   - Script must be executed as root.
@@ -120,7 +120,7 @@ Optional:
   --verbose                 Show full command output.
   --dry-run                 Show commands, do not execute.
   --cleanup-v1-agent        Remove classic zabbix-agent (v1) before install.
-  --with-tools              Also install zabbix-get and zabbix-sender.
+  --with-tools              Also install zabbix-get and zabbix-sender when available.
   --insecure                Ignore SSL certificate errors (curl -k).
   -h, --help                Show this help.
 
