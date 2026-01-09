@@ -257,7 +257,7 @@ fi
 TAG_INFO="${C_BLUE}[*]${C_RESET}"
 TAG_WARN="${C_YELLOW}[!]${C_RESET}"
 TAG_ERR="${C_RED}[✗]${C_RESET}"
-TAG_OK="${C_GREEN}[OK]${C_RESET}"
+TAG_OK="${C_GREEN}[+]${C_RESET}"
 
 # Spinner visuals (dim)
 SPIN_DIM="${C_DIM}"
@@ -1557,8 +1557,7 @@ elif is_rpm; then
 fi
 
 printf "\n"
-ok "[+] Zabbix Agent installation process finished."
-printf "\n"
+ok "Zabbix Agent installation process finished."
 if [[ $DRY_RUN -eq 1 ]]; then
     printf "    NOTE: This was a dry run. No actual changes were made to the system.\n"
 fi
