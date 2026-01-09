@@ -221,27 +221,19 @@ if [[ $DRY_RUN -eq 0 && -f "$0" && "$0" != /dev/fd/* && "$0" != /proc/self/fd/* 
 fi
 
 # -------------------------------------------------------------------------
-# Logging Colors (AUTO: enabled only when terminal supports it)
+# Logging + Spinner Colors (AUTO, TTY-safe, NO_COLOR aware)
 # -------------------------------------------------------------------------
 ENABLE_COLORS=0
 
-# Respect the de-facto standard opt-out
-# (If NO_COLOR=1 in environment, force disable colors)
 if [[ "${NO_COLOR:-}" != "1" ]]; then
-  # Only colorize if stdout is a TTY (avoid polluting logs/files/cron)
-  if [[ -t 1 ]]; then
-    # TERM must exist and not be dumb
-    if [[ -n "${TERM:-}" && "${TERM:-}" != "dumb" ]]; then
-      # If tput exists, verify color capability
-      if command -v tput >/dev/null 2>&1; then
-        _tput_colors="$(tput colors 2>/dev/null || echo 0)"
-        if [[ "${_tput_colors}" =~ ^[0-9]+$ ]] && (( _tput_colors >= 8 )); then
-          ENABLE_COLORS=1
-        fi
-      else
-        # No tput: best-effort (most modern terms support ANSI)
+  if [[ -t 1 && -n "${TERM:-}" && "${TERM:-}" != "dumb" ]]; then
+    if command -v tput >/dev/null 2>&1; then
+      _tput_colors="$(tput colors 2>/dev/null || echo 0)"
+      if [[ "${_tput_colors}" =~ ^[0-9]+$ ]] && (( _tput_colors >= 8 )); then
         ENABLE_COLORS=1
       fi
+    else
+      ENABLE_COLORS=1
     fi
   fi
 fi
@@ -249,13 +241,27 @@ fi
 if (( ENABLE_COLORS )); then
   C_RESET=$'\033[0m'
   C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+
   C_RED=$'\033[31m'
   C_GREEN=$'\033[32m'
   C_YELLOW=$'\033[33m'
   C_BLUE=$'\033[34m'
+  C_CYAN=$'\033[36m'
 else
-  C_RESET=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+  C_RESET=""; C_DIM=""; C_BOLD=""
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""
 fi
+
+# Simple level tags (colorized when enabled)
+TAG_INFO="${C_BLUE}[*]${C_RESET}"
+TAG_WARN="${C_YELLOW}[!]${C_RESET}"
+TAG_ERR="${C_RED}[✗]${C_RESET}"
+TAG_OK="${C_GREEN}[OK]${C_RESET}"
+
+# Spinner visuals (dim)
+SPIN_DIM="${C_DIM}"
+SPIN_RESET="${C_RESET}"
 
 # -------------------------------------------------------------------------
 # Helper Functions
@@ -264,9 +270,9 @@ get_timestamp() {
     date '+%Y-%m-%d %H:%M:%S'
 }
 
-log()  { printf "%s[%s]%s %s[*]%s %s\n"  "$C_DIM" "$(get_timestamp)" "$C_RESET" "$C_BLUE"   "$C_RESET" "$*"; }
-warn() { printf "%s[%s]%s %s[!]%s %s\n"  "$C_DIM" "$(get_timestamp)" "$C_RESET" "$C_YELLOW" "$C_RESET" "$*" >&2; }
-die()  { printf "%s[%s]%s %s[✗]%s %s\n"  "$C_DIM" "$(get_timestamp)" "$C_RESET" "$C_RED"    "$C_RESET" "$*" >&2; exit 1; }
+log()  { printf "%s[%s]%s %s %s\n" "$C_DIM" "$(get_timestamp)" "$C_RESET" "$TAG_INFO" "$*"; }
+warn() { printf "%s[%s]%s %s %s\n" "$C_DIM" "$(get_timestamp)" "$C_RESET" "$TAG_WARN" "$*" >&2; }
+die()  { printf "%s[%s]%s %s %s\n" "$C_DIM" "$(get_timestamp)" "$C_RESET" "$TAG_ERR"  "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Função para comandos rápidos que não devem sujar a tela (ex: sed, echo, rm)
@@ -312,114 +318,136 @@ ver_ge_xy() {
 
 # Função visual para comandos demorados (dnf, apt, curl)
 execute() {
-    local cmd_str="$*"
-    
-    # Se for Dry Run
-    if [[ $DRY_RUN -eq 1 ]]; then
-        log "[DRY] $cmd_str"
-        return 0
-    fi
+  local cmd_str="$*"
 
-    # Se for Verbose, roda sem spinner
-    if [[ $VERBOSE -eq 1 ]]; then
-        log "Exec: $cmd_str"
-        if ! "$@"; then die "Command failed: $cmd_str"; fi
-        return 0
-    fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "[DRY] $cmd_str"
+    return 0
+  fi
 
-    # Modo Visual: Imprime mensagem e roda spinner na mesma linha
-    # Tenta usar o primeiro argumento como "Descrição" se não for um comando óbvio,
-    # senão usa o comando todo. Mas para não quebrar seu script existente,
-    # vamos apenas imprimir que está processando.
-    
-    printf "[%s] [*] Processing: %-40s" "$(get_timestamp)" "${cmd_str:0:40}..."
-    
-    local temp_out
-    temp_out="$(tmpfile_create)"
-    
-    "$@" > "$temp_out" 2>&1 &
-    local pid=$!
-    local delay=0.1
-    local spinstr='|/-\'
-    
-    tput civis 2>/dev/null || true
-    
-    while ps -p "$pid" > /dev/null 2>&1; do
-        local temp=${spinstr#?}
-        printf "[%c]" "$spinstr"
-		spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b"
+  if [[ $VERBOSE -eq 1 ]]; then
+    log "Exec: $cmd_str"
+    if ! "$@"; then die "Command failed: $cmd_str"; fi
+    return 0
+  fi
+
+  # One-line progress with spinner (TTY only)
+  local prefix
+  prefix="$(printf "%s[%s]%s %s Processing:%s " \
+    "$C_DIM" "$(get_timestamp)" "$C_RESET" "${C_CYAN}" "$C_RESET")"
+
+  local msg="${cmd_str}"
+  # Keep the line short and stable
+  if ((${#msg} > 60)); then
+    msg="${msg:0:57}..."
+  fi
+
+  printf "%s%s" "$prefix" "$msg"
+
+  local temp_out pid delay spinstr exit_code
+  temp_out="$(tmpfile_create)"
+
+  "$@" >"$temp_out" 2>&1 &
+  pid=$!
+  delay=0.1
+  spinstr='|/-\'
+
+  # Hide cursor if possible
+  tput civis 2>/dev/null || true
+
+  # Spinner only if stdout is a TTY; otherwise it will just run quietly
+  if [[ -t 1 ]]; then
+    while ps -p "$pid" >/dev/null 2>&1; do
+      local ch="${spinstr:0:1}"
+      spinstr="${spinstr:1}${ch}"
+      printf " %s%s%s" "$SPIN_DIM" "$ch" "$SPIN_RESET"
+      sleep "$delay"
+      printf "\b\b"
     done
-    
-    local exit_code
-    # Capture background exit code without tripping 'set -e'
-    if wait "$pid"; then
-        exit_code=0
-    else
-        exit_code=$?
-    fi
-    tput cnorm 2>/dev/null || true
+  else
+    wait "$pid" || true
+  fi
 
-    if [[ $exit_code -eq 0 ]]; then
-        printf "%s[OK]%s\n" "$C_GREEN" "$C_RESET"
-        rm -f "$temp_out"
-    else
-        printf "%s[FAIL]%s\n" "$C_RED" "$C_RESET"
-        cat "$temp_out" >&2
-        rm -f "$temp_out"
-        die "Command failed: $cmd_str"
-    fi
+  if wait "$pid"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+
+  tput cnorm 2>/dev/null || true
+
+  if [[ $exit_code -eq 0 ]]; then
+    printf " %s[OK]%s\n" "$C_GREEN" "$C_RESET"
+    rm -f "$temp_out"
+  else
+    printf " %s[FAIL]%s\n" "$C_RED" "$C_RESET"
+    cat "$temp_out" >&2
+    rm -f "$temp_out"
+    die "Command failed: $cmd_str"
+  fi
 }
 
 execute_may_fail() {
-    local cmd_str="$*"
-    if [[ $DRY_RUN -eq 1 ]]; then
-        log "[DRY][IGNORE] $cmd_str"
-        LAST_MAY_FAIL_RC=0
-        return 0
-    fi
+  local cmd_str="$*"
 
-    printf "[%s] [*] Attempting: %-40s" "$(get_timestamp)" "${cmd_str:0:40}..."
-
-    local temp_out
-    temp_out="$(tmpfile_create)"
-
-    "$@" > "$temp_out" 2>&1 &
-    local pid=$!
-    local delay=0.1
-    local spinstr='|/-\'
-
-    tput civis 2>/dev/null || true
-    while ps -p "$pid" > /dev/null 2>&1; do
-        local temp=${spinstr#?}
-        printf "[%c]" "$spinstr"
-        spinstr=$temp${spinstr%"$temp"}
-        sleep "$delay"
-        printf "\b\b\b"
-    done
-
-    local exit_code
-    # Capture background exit code without tripping 'set -e'
-    if wait "$pid"; then
-        exit_code=0
-    else
-        exit_code=$?
-    fi
-    tput cnorm 2>/dev/null || true
-
-    LAST_MAY_FAIL_RC="$exit_code"
-
-    if [[ $exit_code -eq 0 ]]; then
-        printf "%s[OK]%s\n" "$C_GREEN" "$C_RESET"
-    else
-        printf "%s[SKIP]%s\n" "$C_YELLOW" "$C_RESET"
-        tail -n 50 "$temp_out" >&2 || true
-    fi
-    rm -f "$temp_out"
-
-    # IMPORTANT: must not propagate non-zero under `set -e`
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "[DRY][IGNORE] $cmd_str"
+    LAST_MAY_FAIL_RC=0
     return 0
+  fi
+
+  local prefix
+  prefix="$(printf "%s[%s]%s %s Attempting:%s " \
+    "$C_DIM" "$(get_timestamp)" "$C_RESET" "${C_CYAN}" "$C_RESET")"
+
+  local msg="${cmd_str}"
+  if ((${#msg} > 60)); then
+    msg="${msg:0:57}..."
+  fi
+
+  printf "%s%s" "$prefix" "$msg"
+
+  local temp_out pid delay spinstr exit_code
+  temp_out="$(tmpfile_create)"
+
+  "$@" >"$temp_out" 2>&1 &
+  pid=$!
+  delay=0.1
+  spinstr='|/-\'
+
+  tput civis 2>/dev/null || true
+
+  if [[ -t 1 ]]; then
+    while ps -p "$pid" >/dev/null 2>&1; do
+      local ch="${spinstr:0:1}"
+      spinstr="${spinstr:1}${ch}"
+      printf " %s%s%s" "$SPIN_DIM" "$ch" "$SPIN_RESET"
+      sleep "$delay"
+      printf "\b\b"
+    done
+  else
+    wait "$pid" || true
+  fi
+
+  if wait "$pid"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+
+  tput cnorm 2>/dev/null || true
+
+  LAST_MAY_FAIL_RC="$exit_code"
+
+  if [[ $exit_code -eq 0 ]]; then
+    printf " %s[OK]%s\n" "$C_GREEN" "$C_RESET"
+  else
+    printf " %s[SKIP]%s\n" "$C_YELLOW" "$C_RESET"
+    tail -n 50 "$temp_out" >&2 || true
+  fi
+
+  rm -f "$temp_out"
+  return 0
 }
 
 # -------------------------------------------------------------------------
