@@ -28,23 +28,20 @@
 #     --server <IP1,IP2> \
 #     [--active <IP>] \
 #     [--repo <X.Y>] \
-#     [--agent-flavor <1|2|auto>] \
+#     [--agent-flavor <1|2>] \
 #     [--force] [--verbose] [--dry-run] \
-#     [--cleanup-v1-agent] [--with-tools] \
-#     [--insecure]
+#     [--with-tools] [--insecure]
 #
 # Options:
 #   --server            Address/FQDN of the Zabbix Proxy/Server for passive checks (Server=).
 #   --active            Address/FQDN of the Zabbix Server/Proxy for active checks (ServerActive=).
 #   --repo              Force repo branch (e.g., 5.0, 6.0, 6.4, 7.0, 7.4).
 #   --agent-flavor      Which agent to install:
-#                         2    = force zabbix-agent2 only (error if unavailable)
+#                         2    = force zabbix-agent2 only
 #                         1    = force classic zabbix-agent (v1)
-#                         auto = prefer agent2, fallback to agent (default)
 #   --force             Force reinstall/downgrade of the agent package even if one is already installed.
 #   --verbose           Display full command output instead of suppressing it.
 #   --dry-run           Show what commands would be run without actually executing them.
-#   --cleanup-v1-agent  Stop, disable, and remove the classic zabbix-agent (v1) before install.
 #   --with-tools        Also install zabbix-get and zabbix-sender when available.
 #   --insecure          Ignore SSL certificate errors (curl -k).
 #   --no-gpg-check      Disable RPM/DNF/YUM package signature verification (also implied by --insecure unless overridden).
@@ -86,16 +83,16 @@ export DEBIAN_FRONTEND=noninteractive
 SERVER=""
 ACTIVE=""
 REPO_OVERRIDE=""
-AGENT_FLAVOR="auto"    # 1 | 2 | auto
+AGENT_FLAVOR=""    # 1 | 2 (mandatory)
 FORCE=0
 REPO_BRANCH=""
 REPO_FALLBACK=""
 DRY_RUN=0
 VERBOSE=0
-CLEANUP_V1=0
 INSTALL_TOOLS=0
 CURL_OPTS=()
 INSECURE=0
+APT_UPDATED=0
 
 NO_GPGCHECK=0
 NO_GPGCHECK_SET=0
@@ -126,11 +123,10 @@ Mandatory:
 Optional:
   --active <value>          Zabbix Server/Proxy for active checks (ServerActive=).
   --repo <X.Y>              Force repo branch (5.0, 6.0, 6.4, 7.0, 7.4).
-  --agent-flavor <1|2|auto> Which agent to install (default: auto).
+  --agent-flavor <1|2>      Which agent to install (mandatory).
   --force                   Force reinstall/downgrade of agent package.
   --verbose                 Show full command output.
   --dry-run                 Show commands, do not execute.
-  --cleanup-v1-agent        Remove classic zabbix-agent (v1) before install.
   --with-tools              Also install zabbix-get and zabbix-sender.
   --insecure                Ignore SSL certificate errors (curl -k).
   --no-gpg-check            Disable RPM/DNF/YUM package signature verification (also implied by --insecure unless overridden).
@@ -158,11 +154,11 @@ while [[ $# -gt 0 ]]; do
         --repo)
             REPO_OVERRIDE="${2:-}"; shift 2 ;;
         --agent-flavor)
-            AGENT_FLAVOR="${2:-auto}"
+            AGENT_FLAVOR="${2:-}"
             case "$AGENT_FLAVOR" in
-                1|2|auto) ;;
+                1|2) ;;
                 *)
-                    echo "[!] Invalid value for --agent-flavor: '$AGENT_FLAVOR' (use 1, 2, or auto)" >&2
+                    echo "[!] Invalid value for --agent-flavor: '$AGENT_FLAVOR' (use 1 or 2)" >&2
                     exit 1 ;;
             esac
             shift 2 ;;
@@ -172,8 +168,6 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=1; shift ;;
         --verbose)
             VERBOSE=1; shift ;;
-        --cleanup-v1-agent)
-            CLEANUP_V1=1; shift ;;
         --with-tools)
             INSTALL_TOOLS=1; shift ;;
 		--insecure)
@@ -199,6 +193,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$SERVER" ]] || { echo "[!] Missing required parameter: --server" >&2; print_usage; exit 1; }
+[[ -n "$AGENT_FLAVOR" ]] || { echo "[!] Missing required parameter: --agent-flavor (use 1 or 2)" >&2; print_usage; exit 1; }
 
 # If --insecure was used and user did not explicitly choose gpg behavior, default to no-gpg-check
 if [[ $INSECURE -eq 1 && $NO_GPGCHECK_SET -eq 0 ]]; then
@@ -365,8 +360,6 @@ execute() {
       sleep "$delay"
       printf "\b\b"
     done
-  else
-    wait "$pid" || true
   fi
 
   if wait "$pid"; then
@@ -415,9 +408,11 @@ execute_may_fail() {
   pid=$!
   delay=0.1
   spinstr='|/-\'
-
+  
+  # Hide cursor if possible
   tput civis 2>/dev/null || true
 
+  # Spinner only if stdout is a TTY; otherwise it will just run quietly
   if [[ -t 1 ]]; then
     while ps -p "$pid" >/dev/null 2>&1; do
       local ch="${spinstr:0:1}"
@@ -426,8 +421,6 @@ execute_may_fail() {
       sleep "$delay"
       printf "\b\b"
     done
-  else
-    wait "$pid" || true
   fi
 
   if wait "$pid"; then
@@ -852,6 +845,58 @@ rpm_lock_busy() {
 }
 
 # -------------------------------------------------------------------------
+# Wait for apt/dpkg Lock (Debian/Ubuntu)
+# -------------------------------------------------------------------------
+apt_lock_busy() {
+    # Prefer fuser, fallback to lsof, else "unknown" => assume not busy.
+    local locks=(
+        /var/lib/dpkg/lock-frontend
+        /var/lib/dpkg/lock
+        /var/lib/apt/lists/lock
+        /var/cache/apt/archives/lock
+    )
+
+    if have fuser; then
+        local f
+        for f in "${locks[@]}"; do
+            [[ -e "$f" ]] || continue
+            fuser "$f" >/dev/null 2>&1 && return 0
+        done
+        return 1
+    fi
+
+    if have lsof; then
+        local f
+        for f in "${locks[@]}"; do
+            [[ -e "$f" ]] || continue
+            lsof "$f" >/dev/null 2>&1 && return 0
+        done
+        return 1
+    fi
+
+    return 1
+}
+
+wait_for_apt_lock() {
+    local retries=30 # ~5 min timeout
+    [[ $DRY_RUN -eq 1 ]] && return 0
+
+    if ! is_deb; then
+        return 0
+    fi
+
+    log "Checking for apt/dpkg activity..."
+
+    while proc_running apt || proc_running apt-get || proc_running dpkg || apt_lock_busy; do
+        ((retries--)) || die "Timeout waiting for apt/dpkg to finish"
+        warn "apt/dpkg is running or APT/DPKG locks are held. Waiting 10 seconds..."
+        sleep 10
+    done
+
+    log "apt/dpkg lock is free and no active process detected."
+}
+
+# -------------------------------------------------------------------------
 # Wait for dnf/yum Lock
 # -------------------------------------------------------------------------
 wait_for_dnf_lock() {
@@ -967,6 +1012,89 @@ get_service_enabled() {
 }
 
 # -------------------------------------------------------------------------
+# Agent Removal Helpers (best-effort, multi-init, multi-pkgmgr)
+# -------------------------------------------------------------------------
+stop_disable_service_best_effort() {
+    local svc="$1"
+
+    if have systemctl; then
+        execute_may_fail systemctl stop "$svc"
+        execute_may_fail systemctl disable "$svc"
+        execute_may_fail systemctl daemon-reload
+        return 0
+    fi
+
+    if have service; then
+        execute_may_fail service "$svc" stop
+        return 0
+    fi
+
+    return 0
+}
+
+remove_pkg_deb() {
+    local pkg="$1"
+
+    if dpkg -s "$pkg" >/dev/null 2>&1; then
+		wait_for_apt_lock
+        execute apt-get -y purge "$pkg"
+    fi
+}
+
+remove_pkg_rpm() {
+    local pkg="$1"
+
+    if ! rpm -q "$pkg" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Legacy EL5: prefer rpm erase (yum can be unreliable there)
+    local major=""
+    major="${DISTRO_VER%%.*}"
+    if [[ ( "$DISTRO_ID" == "rhel" || "$DISTRO_ID" == "centos" || "$DISTRO_ID" == "ol" ) && -n "$major" && "$major" -le 5 ]]; then
+        wait_for_dnf_lock
+        execute rpm -e "$pkg" || execute rpm -e --noscripts "$pkg"
+        return 0
+    fi
+
+    wait_for_dnf_lock
+    if have dnf; then
+        execute dnf remove -y "${PKG_NOGPGCHECK_ARGS[@]}" "$pkg"
+        return 0
+    fi
+    if have yum; then
+        execute yum remove -y "${PKG_NOGPGCHECK_ARGS[@]}" "$pkg"
+        return 0
+    fi
+
+    # Fallback
+    execute rpm -e "$pkg" || execute rpm -e --noscripts "$pkg"
+}
+
+remove_other_agent_if_present() {
+    # desired: "1" or "2"
+    local desired="$1"
+
+    if [[ "$desired" == "1" ]]; then
+        # Remove Agent 2 if present
+        stop_disable_service_best_effort "zabbix-agent2"
+        if is_deb; then
+            remove_pkg_deb "zabbix-agent2"
+        else
+            remove_pkg_rpm "zabbix-agent2"
+        fi
+    else
+        # Remove Agent 1 if present
+        stop_disable_service_best_effort "zabbix-agent"
+        if is_deb; then
+            remove_pkg_deb "zabbix-agent"
+        else
+            remove_pkg_rpm "zabbix-agent"
+        fi
+    fi
+}
+
+# -------------------------------------------------------------------------
 # Package Version Helpers
 # -------------------------------------------------------------------------
 get_installed_version() {
@@ -990,6 +1118,11 @@ get_candidate_version() {
     local cand=""
 
     if is_deb; then
+		if [[ "${APT_UPDATED:-0}" -ne 1 ]]; then
+            wait_for_apt_lock
+            execute_may_fail apt-get update
+            APT_UPDATED=1
+        fi
         cand="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2}' || true)"
     elif is_rpm; then
         if have dnf; then
@@ -1080,7 +1213,8 @@ install_zbx_rpm_direct() {
     execute curl "${CURL_OPTS[@]}" --connect-timeout 20 -fsSL "${base}/${rpm_name}" -o "$tmp"
 
     log "Installing package '${pkg}' via rpm -Uvh..."
-    execute rpm -Uvh --force "${RPM_NOGPG_ARGS[@]}" "$tmp"
+    # --replacepkgs garante reinstalação mesmo se a mesma versão já estiver instalada
+    execute rpm -Uvh --force --replacepkgs "${RPM_NOGPG_ARGS[@]}" "$tmp"
 }
 
 # -------------------------------------------------------------------------
@@ -1094,48 +1228,6 @@ if is_rpm; then
     if [[ ( "$DISTRO_ID" == "rhel" || "$DISTRO_ID" == "centos" || "$DISTRO_ID" == "ol" ) && "$major" -le 5 ]]; then
         ZBX_BASE_URL_RPM="http://repo.zabbix.com/zabbix"
         log "Legacy RHEL-like (${DISTRO_VER}) detected. Using HTTP for Zabbix RPM repo."
-    fi
-fi
-
-# ------------------ V1 Agent Cleanup Logic ------------------
-if have zabbix_agentd; then
-    if [[ $CLEANUP_V1 -eq 1 ]]; then
-        log "Classic zabbix-agent (v1) found. Proceeding with removal as requested by --cleanup-v1-agent flag."
-
-        if is_deb; then
-            log "Detected Debian-based system. Stopping zabbix-agent service..."
-            if have systemctl; then
-                execute_may_fail systemctl stop zabbix-agent
-                execute_may_fail systemctl disable zabbix-agent
-            elif have service; then
-                execute_may_fail service zabbix-agent stop
-            fi
-            log "Purging zabbix-agent package (best-effort)..."
-            execute_may_fail apt-get -y purge zabbix-agent
-
-        elif is_rpm; then
-            log "Detected RPM-based system. Checking dnf/yum lock and stopping service..."
-            wait_for_dnf_lock
-
-            if have systemctl; then
-                execute_may_fail systemctl stop zabbix-agent
-                execute_may_fail systemctl disable zabbix-agent
-            elif have service; then
-                execute_may_fail service zabbix-agent stop
-            fi
-
-            log "Removing zabbix-agent package via rpm (not using yum/dnf)..."
-            if rpm -q zabbix-agent >/dev/null 2>&1; then
-                execute_may_fail rpm -e zabbix-agent
-            else
-                log "Package 'zabbix-agent' is not installed (nothing to remove)."
-            fi
-        fi
-
-        log "Classic zabbix-agent (v1) cleanup phase completed (check warnings above, if any)."
-    else
-        warn "Classic zabbix-agent (v1) is installed. This script manages both agent1 and agent2."
-        warn "Coexistence of two agents is not recommended. Use --cleanup-v1-agent to remove v1 before install."
     fi
 fi
 
@@ -1245,16 +1337,19 @@ if is_deb; then
 
         have dpkg || die "Command 'dpkg' not found."
         log "Removing old Zabbix repo definitions (if any)..."
+		wait_for_apt_lock
         execute_may_fail apt-get -y purge zabbix-release
         execute rm -f /etc/apt/sources.list.d/zabbix*.list
 
         log "Installing Zabbix release package..."
+		wait_for_apt_lock
         execute dpkg -i "$TMPFILE"
         REPO_WAS_INSTALLED=1
     fi
 
     if [[ "$REPO_WAS_INSTALLED" -eq 1 ]]; then
         log "Updating package lists after repository installation..."
+		wait_for_apt_lock
         execute apt-get update
     else
         log "Repository already present. Skipping apt-get update."
@@ -1268,10 +1363,8 @@ elif is_rpm; then
     if [[ -f "$CURRENT_REPO_FILE" && "$(grep 'baseurl=' "$CURRENT_REPO_FILE" 2>/dev/null)" == *"/zabbix/${REPO_BRANCH}/"* ]]; then
         log "Existing Zabbix repo file is already configured for branch ${REPO_BRANCH}."
         log "Skipping zabbix-release reinstall."
-		if [[ $INSECURE -eq 1 ]]; then
-            log "Insecure mode enabled. Disabling SSL verification for Zabbix repo (sslverify=0)."
-            sync_insecure_repo_settings_rpm
-        fi
+		# Always normalize sslverify in zabbix*.repo (removes leftover sslverify=0 from older runs)
+        sync_insecure_repo_settings_rpm
     else
         log "Local Zabbix repo definition missing or not matching branch ${REPO_BRANCH}. Preparing fresh zabbix-release installation."
         wait_for_dnf_lock
@@ -1297,17 +1390,13 @@ elif is_rpm; then
             log "Installing Zabbix release package via rpm..."
             wait_for_dnf_lock
             execute rpm -Uvh --force "${RPM_NOGPG_ARGS[@]}" "$TMPFILE"
-			if [[ $INSECURE -eq 1 ]]; then
-                log "Insecure mode enabled. Disabling SSL verification for Zabbix repo (sslverify=0)."
-                sync_insecure_repo_settings_rpm
-            fi
+			# Always normalize sslverify in zabbix*.repo (removes leftover sslverify=0 from older runs)
+			sync_insecure_repo_settings_rpm
         elif [[ "$ARCH" == "aarch64" ]]; then
             warn "zabbix-release package not found for aarch64. Creating repo file manually as a fallback."
             _create_repo_file_rpm "$REPO_BRANCH"
-			if [[ $INSECURE -eq 1 ]]; then
-                log "Insecure mode enabled. Disabling SSL verification for Zabbix repo (sslverify=0)."
-                sync_insecure_repo_settings_rpm
-            fi
+			# Always normalize sslverify in zabbix*.repo (removes leftover sslverify=0 from older runs)
+			sync_insecure_repo_settings_rpm
         else
             die "Repository URL could not be determined for this RPM-based system."
         fi
@@ -1354,60 +1443,34 @@ NEED_INSTALL=0
 INSTALLED_V2="$(get_installed_version zabbix-agent2)"
 INSTALLED_V1="$(get_installed_version zabbix-agent)"
 
-case "$AGENT_FLAVOR" in
-    2)
-        AGENT_PKG="zabbix-agent2"
-        AGENT_TYPE="2"
-        INSTALLED="$INSTALLED_V2"
-        if [[ -z "$INSTALLED" ]]; then
-            NEED_INSTALL=1
-        fi
-        ;;
-    1)
-        AGENT_PKG="zabbix-agent"
-        AGENT_TYPE="1"
-        INSTALLED="$INSTALLED_V1"
-        if [[ -z "$INSTALLED" ]]; then
-            NEED_INSTALL=1
-        fi
-        ;;
-    auto)
-        if [[ -n "$INSTALLED_V2" ]]; then
-            AGENT_PKG="zabbix-agent2"
-            AGENT_TYPE="2"
-            INSTALLED="$INSTALLED_V2"
-            NEED_INSTALL=0
-            log "Existing Zabbix Agent 2 detected. Will reuse installed package without changing version (unless --force)."
-        elif [[ -n "$INSTALLED_V1" ]]; then
-            AGENT_PKG="zabbix-agent"
-            AGENT_TYPE="1"
-            INSTALLED="$INSTALLED_V1"
-            NEED_INSTALL=0
-            log "Existing classic Zabbix Agent (v1) detected. Will reuse installed package without changing version (unless --force)."
-        else
-            # Nenhum agente instalado: preferir agent2 se disponível no repo
-            CANDIDATE="$(get_candidate_version zabbix-agent2)"
-            if [[ -n "$CANDIDATE" && "$CANDIDATE" != "(none)" && "$CANDIDATE" != "Available" ]]; then
-                AGENT_PKG="zabbix-agent2"
-                AGENT_TYPE="2"
-                NEED_INSTALL=1
-            else
-                if [[ -n "$CANDIDATE" ]]; then
-                    log "zabbix-agent2 candidate not valid or not available. Trying classic 'zabbix-agent'..."
-                fi
-                CANDIDATE="$(get_candidate_version zabbix-agent)"
-                if [[ -n "$CANDIDATE" && "$CANDIDATE" != "(none)" && "$CANDIDATE" != "Available" ]]; then
-                    AGENT_PKG="zabbix-agent"
-                    AGENT_TYPE="1"
-                    NEED_INSTALL=1
-                    log "Falling back to classic Zabbix Agent (v1) package 'zabbix-agent'."
-                else
-                    die "No suitable Zabbix agent package found (neither zabbix-agent2 nor zabbix-agent) in repo ${REPO_BRANCH} (tag ${REPO_TAG})."
-                fi
-            fi
-        fi
-        ;;
-esac
+# Enforce mutual exclusion: if user requested one agent, remove the other if installed.
+if [[ "$AGENT_FLAVOR" == "1" ]]; then
+    if [[ -n "$INSTALLED_V2" ]]; then
+        log "Requested Agent 1, but Agent 2 is installed. Removing Agent 2 first..."
+        remove_other_agent_if_present "1"
+        INSTALLED_V2=""
+    fi
+
+    AGENT_PKG="zabbix-agent"
+    AGENT_TYPE="1"
+    INSTALLED="$(get_installed_version zabbix-agent)"
+    [[ -z "$INSTALLED" ]] && NEED_INSTALL=1 || NEED_INSTALL=0
+fi
+
+if [[ "$AGENT_FLAVOR" == "2" ]]; then
+    if [[ -n "$INSTALLED_V1" ]]; then
+        log "Requested Agent 2, but Agent 1 is installed. Removing Agent 1 first..."
+        remove_other_agent_if_present "2"
+        INSTALLED_V1=""
+    fi
+
+    AGENT_PKG="zabbix-agent2"
+    AGENT_TYPE="2"
+    INSTALLED="$(get_installed_version zabbix-agent2)"
+    [[ -z "$INSTALLED" ]] && NEED_INSTALL=1 || NEED_INSTALL=0
+fi
+
+[[ -n "$AGENT_PKG" && -n "$AGENT_TYPE" ]] || die "Internal error: agent selection failed (AGENT_PKG/AGENT_TYPE empty)."
 
 # Se for necessário instalar ou se --force foi pedido, buscar versão candidata do pacote selecionado
 if [[ $NEED_INSTALL -eq 1 || $FORCE -eq 1 ]]; then
@@ -1424,29 +1487,60 @@ log "Installed version: ${INSTALLED:-(none)}"
 [[ -n "$CANDIDATE" ]] && log "Candidate version: ${CANDIDATE}"
 
 # -------------------------------------------------------------------------
-# Agent Installation / Upgrade
+# Agent Installation / Upgrade / Reinstall (FORCE)
 # -------------------------------------------------------------------------
 if [[ $NEED_INSTALL -eq 0 && $FORCE -eq 0 ]]; then
     log "Agent package '${AGENT_PKG}' already installed (version: ${INSTALLED:-<unknown>})."
     log "Skipping package installation/upgrade (use --force to reinstall/upgrade)."
 else
-    log "Installing/Updating ${AGENT_PKG}${CANDIDATE:+ to version $CANDIDATE}..."
-    if is_deb; then
-        execute apt-get install -y --allow-downgrades "$AGENT_PKG"
-    else
-        # RPM-based
-        if [[ "$REPO_TAG" == "el5" ]]; then
-            log "Legacy EL5 detected. Installing '${AGENT_PKG}' directly via rpm (not using yum/dnf)."
-            wait_for_dnf_lock
-            install_zbx_rpm_direct "$AGENT_PKG"
+    if [[ $FORCE -eq 1 && $NEED_INSTALL -eq 0 ]]; then
+        log "Force mode enabled. Reinstalling ${AGENT_PKG}${CANDIDATE:+ (candidate $CANDIDATE)}..."
+        if is_deb; then
+            wait_for_apt_lock
+			if [[ "${APT_UPDATED:-0}" -ne 1 ]]; then
+		        execute_may_fail apt-get update
+		        APT_UPDATED=1
+		    fi
+            execute apt-get install -y --reinstall --allow-downgrades "$AGENT_PKG"
         else
-            wait_for_dnf_lock
-            if have dnf; then
-                execute dnf install -y "${PKG_NOGPGCHECK_ARGS[@]}" "$AGENT_PKG"
-            elif have yum; then
-                execute yum install -y "${PKG_NOGPGCHECK_ARGS[@]}" "$AGENT_PKG"
+            if [[ "$REPO_TAG" == "el5" ]]; then
+                log "Legacy EL5 detected. Reinstalling '${AGENT_PKG}' directly via rpm."
+                wait_for_dnf_lock
+                install_zbx_rpm_direct "$AGENT_PKG"
             else
-                die "Neither dnf nor yum detected; cannot install ${AGENT_PKG}."
+                wait_for_dnf_lock
+                if have dnf; then
+                    execute dnf reinstall -y "${PKG_NOGPGCHECK_ARGS[@]}" "$AGENT_PKG"
+                elif have yum; then
+                    # yum reinstall nem sempre existe/funciona em versões antigas -> fallback
+                    execute_may_fail yum reinstall -y "${PKG_NOGPGCHECK_ARGS[@]}" "$AGENT_PKG"
+                    if [[ "${LAST_MAY_FAIL_RC:-0}" -ne 0 ]]; then
+                        execute yum install -y "${PKG_NOGPGCHECK_ARGS[@]}" "$AGENT_PKG"
+                    fi
+                else
+                    die "Neither dnf nor yum detected; cannot reinstall ${AGENT_PKG}."
+                fi
+            fi
+        fi
+    else
+        log "Installing/Updating ${AGENT_PKG}${CANDIDATE:+ to version $CANDIDATE}..."
+        if is_deb; then
+            wait_for_apt_lock
+            execute apt-get install -y --allow-downgrades "$AGENT_PKG"
+        else
+            if [[ "$REPO_TAG" == "el5" ]]; then
+                log "Legacy EL5 detected. Installing '${AGENT_PKG}' directly via rpm (not using yum/dnf)."
+                wait_for_dnf_lock
+                install_zbx_rpm_direct "$AGENT_PKG"
+            else
+                wait_for_dnf_lock
+                if have dnf; then
+                    execute dnf install -y "${PKG_NOGPGCHECK_ARGS[@]}" "$AGENT_PKG"
+                elif have yum; then
+                    execute yum install -y "${PKG_NOGPGCHECK_ARGS[@]}" "$AGENT_PKG"
+                else
+                    die "Neither dnf nor yum detected; cannot install ${AGENT_PKG}."
+                fi
             fi
         fi
     fi
@@ -1456,6 +1550,7 @@ fi
 if [[ $INSTALL_TOOLS -eq 1 ]]; then
     log "Installing Zabbix tools (zabbix-get, zabbix-sender)..."
     if is_deb; then
+		wait_for_apt_lock
         execute_may_fail apt-get install -y zabbix-get zabbix-sender
     else
         wait_for_dnf_lock
