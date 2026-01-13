@@ -329,8 +329,8 @@ execute() {
 
   # One-line progress with spinner (TTY only)
   local prefix
-  prefix="$(printf "%s[%s]%s %s     Processing:%s " \
-    "$C_DIM" "$(get_timestamp)" "$C_RESET" "${C_CYAN}" "$C_RESET")"
+  prefix="$(printf "%s[%s]%s %s %sProcessing:%s " \
+    "$C_DIM" "$(get_timestamp)" "$C_RESET" "$TAG_INFO" "${C_CYAN}" "$C_RESET")"
 
   local msg="${cmd_str}"
   # Keep the line short and stable
@@ -391,8 +391,8 @@ execute_may_fail() {
   fi
 
   local prefix
-  prefix="$(printf "%s[%s]%s %s Attempting:%s " \
-    "$C_DIM" "$(get_timestamp)" "$C_RESET" "${C_CYAN}" "$C_RESET")"
+  prefix="$(printf "%s[%s]%s %s %sAttempting:%s " \
+    "$C_DIM" "$(get_timestamp)" "$C_RESET" "$TAG_INFO" "${C_CYAN}" "$C_RESET")"
 
   local msg="${cmd_str}"
   if ((${#msg} > 60)); then
@@ -1119,8 +1119,8 @@ get_candidate_version() {
 
     if is_deb; then
 		if [[ "${APT_UPDATED:-0}" -ne 1 ]]; then
-            wait_for_apt_lock
-            execute_may_fail apt-get update
+            wait_for_apt_lock 1>&2
+            execute_may_fail apt-get update 1>&2
             APT_UPDATED=1
         fi
         cand="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2}' || true)"
